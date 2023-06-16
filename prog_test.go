@@ -639,6 +639,10 @@ func TestProgramFromFD(t *testing.T) {
 	}
 }
 
+func TestHaveProgTestRunLive(t *testing.T) {
+	testutils.CheckFeatureTest(t, haveProgRunLive)
+}
+
 func TestHaveProgTestRun(t *testing.T) {
 	testutils.CheckFeatureTest(t, haveProgRun)
 }

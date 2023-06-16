@@ -584,6 +584,35 @@ func (p *Program) Test(in []byte) (uint32, []byte, error) {
 	return ret, opts.DataOut, nil
 }
 
+// TestLive a version of Test to support XDP Live mode. It runs the program with the given input packet,
+// and may output it on the specified interface.
+//
+// This differs from normal Test by writing a packet out of an interface, rather than returning it as a buffer.
+// The return value is not the output value from an ebpf program, but 0 if successful or an errno.
+//
+// This function requires kernel 5.18
+func (p *Program) TestLive(in []byte, dev uint32) (uint32, error) {
+	xdp := sys.XdpMd{
+		Data:           0,
+		DataEnd:        uint32(len(in)),
+		IngressIfindex: dev,
+	}
+
+	opts := RunOptions{
+		Data:    in,
+		Repeat:  1,
+		Context: xdp,
+		Flags:   unix.BPF_F_TEST_XDP_LIVE_FRAMES,
+	}
+
+	ret, _, err := p.run(&opts)
+	if err != nil {
+		return ret, fmt.Errorf("test program: %w", err)
+	}
+
+	return ret, nil
+}
+
 // Run runs the Program in kernel with given RunOptions.
 //
 // Note: the same restrictions from Test apply.
@@ -621,49 +650,64 @@ func (p *Program) Benchmark(in []byte, repeat int, reset func()) (uint32, time.D
 	return ret, total, nil
 }
 
-var haveProgRun = internal.NewFeatureTest("BPF_PROG_RUN", "4.12", func() error {
-	prog, err := NewProgram(&ProgramSpec{
-		// SocketFilter does not require privileges on newer kernels.
-		Type: SocketFilter,
-		Instructions: asm.Instructions{
-			asm.LoadImm(asm.R0, 0, asm.DWord),
-			asm.Return(),
-		},
-		License: "MIT",
-	})
-	if err != nil {
-		// This may be because we lack sufficient permissions, etc.
+var haveProgRunLive = internal.NewFeatureTest("BPF_PROG_RUN_LIVE", "5.18", haveProgRunLiveGeneric(true))
+var haveProgRun = internal.NewFeatureTest("BPF_PROG_RUN", "4.12", haveProgRunLiveGeneric(false))
+
+var haveProgRunLiveGeneric = func(live bool) func() error {
+	return func() error {
+		progSpec := ProgramSpec{
+			// SocketFilter does not require privileges on newer kernels.
+			Type: SocketFilter,
+			Instructions: asm.Instructions{
+				asm.LoadImm(asm.R0, 0, asm.DWord),
+				asm.Return(),
+			},
+			License: "MIT",
+		}
+		if live {
+			// live mode requires XDP
+			progSpec.Type = XDP
+		}
+
+		prog, err := NewProgram(&progSpec)
+		if err != nil {
+			// This may be because we lack sufficient permissions, etc.
+			return err
+		}
+		defer prog.Close()
+
+		in := internal.EmptyBPFContext
+		attr := sys.ProgRunAttr{
+			ProgFd:     uint32(prog.FD()),
+			DataSizeIn: uint32(len(in)),
+			DataIn:     sys.NewSlicePointer(in),
+		}
+
+		if live {
+			attr.Flags = unix.BPF_F_TEST_XDP_LIVE_FRAMES
+		}
+
+		err = sys.ProgRun(&attr)
+		switch {
+		case errors.Is(err, unix.EINVAL):
+			// Check for EINVAL specifically, rather than err != nil since we
+			// otherwise misdetect due to insufficient permissions.
+			return internal.ErrNotSupported
+
+		case errors.Is(err, unix.EINTR):
+			// We know that PROG_TEST_RUN is supported if we get EINTR.
+			return nil
+
+		case errors.Is(err, sys.ENOTSUPP):
+			// The first PROG_TEST_RUN patches shipped in 4.12 didn't include
+			// a test runner for SocketFilter. ENOTSUPP means PROG_TEST_RUN is
+			// supported, but not for the program type used in the probe.
+			return nil
+		}
+
 		return err
 	}
-	defer prog.Close()
-
-	in := internal.EmptyBPFContext
-	attr := sys.ProgRunAttr{
-		ProgFd:     uint32(prog.FD()),
-		DataSizeIn: uint32(len(in)),
-		DataIn:     sys.NewSlicePointer(in),
-	}
-
-	err = sys.ProgRun(&attr)
-	switch {
-	case errors.Is(err, unix.EINVAL):
-		// Check for EINVAL specifically, rather than err != nil since we
-		// otherwise misdetect due to insufficient permissions.
-		return internal.ErrNotSupported
-
-	case errors.Is(err, unix.EINTR):
-		// We know that PROG_TEST_RUN is supported if we get EINTR.
-		return nil
-
-	case errors.Is(err, sys.ENOTSUPP):
-		// The first PROG_TEST_RUN patches shipped in 4.12 didn't include
-		// a test runner for SocketFilter. ENOTSUPP means PROG_TEST_RUN is
-		// supported, but not for the program type used in the probe.
-		return nil
-	}
-
-	return err
-})
+}
 
 func (p *Program) run(opts *RunOptions) (uint32, time.Duration, error) {
 	if uint(len(opts.Data)) > math.MaxUint32 {
@@ -672,6 +716,12 @@ func (p *Program) run(opts *RunOptions) (uint32, time.Duration, error) {
 
 	if err := haveProgRun(); err != nil {
 		return 0, 0, err
+	}
+
+	if opts.Flags&unix.BPF_F_TEST_XDP_LIVE_FRAMES == unix.BPF_F_TEST_XDP_LIVE_FRAMES {
+		if err := haveProgRunLive(); err != nil {
+			return 0, 0, err
+		}
 	}
 
 	var ctxBytes []byte
